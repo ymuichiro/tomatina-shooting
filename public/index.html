@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tomato Squadron</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #0b0f1a;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+        margin: 0 auto;
+      }
+    </style>
+  </head>
+  <body>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.0/dist/phaser.min.js"></script>
+    <script>
+      // Use dynamic size based on browser window
+      let W = window.innerWidth || 480;
+      let H = window.innerHeight || 800;
+      const PLAYER_SPEED = 260;
+      const FIRE_RATE = 90;
+      const BULLET_SPEED = 560;
+      const BULLET_LIFETIME = 1600;
+      const ENEMY_BASE_SPEED = 120;
+      const ENEMY_HP_BASE = 1;
+      const SPAWN_INTERVAL = 550;
+      const DIFFICULTY_STEP_MS = 8000;
+      const DIFFICULTY_GROWTH = 1.12;
+      const FEVER_THRESHOLD = 8;
+      const FEVER_DURATION = 3000;
+      const HYPER_RATE = 40;
+      const HYPER_COOLDOWN = 4500;
+      // === テクスチャ作成関数 ===
+      function makeTomatoTexture(scene) {
+        const g = scene.make.graphics({ x: 0, y: 0, add: false });
+        g.fillStyle(0xd7263d, 1);
+        g.fillCircle(16, 18, 14);
+        g.fillStyle(0xffffff, 0.25);
+        g.fillCircle(10, 12, 4);
+        g.fillStyle(0x2ec4b6, 1);
+        g.beginPath();
+        g.moveTo(16, 3);
+        g.lineTo(12, 9);
+        g.lineTo(20, 9);
+        g.closePath();
+        g.fillPath();
+        g.generateTexture("tomatoBullet", 32, 32);
+        g.destroy();
+      }
+      function makePlayerTexture(scene) {
+        const g = scene.make.graphics({ x: 0, y: 0, add: false });
+        g.fillStyle(0xd7263d, 1);
+        g.beginPath();
+        g.moveTo(18, 0); // nose
+        g.lineTo(28, 10); // right wing tip
+        g.lineTo(22, 10);
+        g.lineTo(22, 26); // tail right
+        g.lineTo(14, 26); // tail left
+        g.lineTo(14, 10);
+        g.lineTo(8, 10); // left wing tip
+        g.closePath();
+        g.fillPath();
+        g.fillStyle(0x1ecbe1, 0.9); // cockpit
+        g.fillEllipse(18, 6, 6, 6);
+        g.generateTexture("player", 36, 28);
+        g.destroy();
+      }
+      function makeEnemyTexture(scene) {
+        const g = scene.make.graphics({ x: 0, y: 0, add: false });
+        g.fillStyle(0x7b8cff, 1);
+        g.beginPath();
+        g.moveTo(18, 0);
+        g.lineTo(30, 8); // right wing
+        g.lineTo(26, 14);
+        g.lineTo(26, 26);
+        g.lineTo(10, 26);
+        g.lineTo(10, 14);
+        g.lineTo(6, 8); // left wing
+        g.closePath();
+        g.fillPath();
+        g.fillStyle(0xffffff, 0.8); // cockpit
+        g.fillEllipse(18, 6, 6, 6);
+        g.generateTexture("enemy", 36, 28);
+        g.destroy();
+      }
+      function makeSeedParticle(scene) {
+        const g = scene.make.graphics({ x: 0, y: 0, add: false });
+        g.fillStyle(0xffe066, 1);
+        g.fillEllipse(2, 1, 3, 2);
+        g.generateTexture("seed", 4, 2);
+        g.destroy();
+      }
+      function makeJuiceParticle(scene) {
+        const g = scene.make.graphics({ x: 0, y: 0, add: false });
+        // green tomato-like color for enemy bullets
+        g.fillStyle(0x2ec4b6, 1);
+        // larger juice particle: center at 5,5 radius 4 on a 10x10 texture
+        g.fillCircle(5, 5, 4);
+        g.generateTexture("juice", 10, 10);
+        g.destroy();
+      }
+      function makeBackground(scene) {
+        const g = scene.make.graphics({ x: 0, y: 0, add: false });
+        g.fillStyle(0x0b0f1a, 1);
+        g.fillRect(0, 0, W, H);
+        g.fillStyle(0x11203a, 1);
+        for (let i = 0; i < 40; i++) {
+          const x = Math.random() * W,
+            y = Math.random() * H,
+            r = 4 + Math.random() * 14;
+          g.fillCircle(x, y, r);
+        }
+        g.generateTexture("bg", W, H);
+        g.destroy();
+      }
+      class GameScene extends Phaser.Scene {
+        constructor() {
+          super("Game");
+        }
+        init() {
+          this.kills = 0;
+          this.consecHits = 0;
+          this.inFever = false;
+          this.feverUntil = 0;
+          this.lastFire = 0;
+          this.lastHyper = -9999;
+          this.nextSpawn = 0;
+          this.difficulty = 1.0;
+          this.lastDiffStep = 0;
+          this.gameOver = false;
+        }
+        preload() {}
+        preload() {
+          // load background music
+          try {
+            this.load.audio("bgm", "music.mp3");
+          } catch (e) {}
+        }
+        create() {
+          // recalc canvas/game size in case of resize
+          W = window.innerWidth || W;
+          H = window.innerHeight || H;
+          makeBackground(this);
+          // play background music if available
+          try {
+            this.sound &&
+              this.sound.add &&
+              this.sound.add("bgm", { loop: true, volume: 0.5 }).play();
+          } catch (e) {}
+          makeTomatoTexture(this);
+          makeEnemyTexture(this);
+          makePlayerTexture(this);
+          makeSeedParticle(this);
+          makeJuiceParticle(this);
+          this.add.image(W / 2, H / 2, "bg").setDepth(-10);
+          this.bgScroll = this.add
+            .tileSprite(W / 2, H / 2, W, H, "bg")
+            .setAlpha(0.25)
+            .setDepth(-9);
+
+          this.player = this.physics.add
+            .image(W / 2, H - 80, "player")
+            .setCollideWorldBounds(true);
+          // tighten player hitbox to better match visible sprite
+          if (
+            this.player.body &&
+            typeof this.player.body.setSize === "function"
+          ) {
+            this.player.body.setSize(20, 14, true);
+          }
+
+          this.bullets = this.physics.add.group({
+            classType: Phaser.Physics.Arcade.Image,
+            maxSize: 400,
+          });
+          this.enemies = this.physics.add.group({
+            classType: Phaser.Physics.Arcade.Image,
+            maxSize: 120,
+          });
+          this.enemyBullets = this.physics.add.group({
+            classType: Phaser.Physics.Arcade.Image,
+            maxSize: 300,
+          });
+          this.powerups = this.physics.add.group({
+            classType: Phaser.Physics.Arcade.Image,
+            maxSize: 6,
+          });
+
+          // 互換性対応: Phaser の createEmitter が存在すればそれを使い、無ければ簡易フォールバックを提供
+          const createCompatEmitter = (key, cfg) => {
+            try {
+              const mgr = this.add.particles ? this.add.particles(key) : null;
+              if (mgr && typeof mgr.createEmitter === "function") {
+                return mgr.createEmitter(cfg);
+              }
+            } catch (e) {
+              // fall through to fallback
+            }
+            // fallback: 必要なメソッドのみ実装（explode）
+            return {
+              explode: (quantity, x, y) => {
+                for (let i = 0; i < quantity; i++) {
+                  const sprite = this.add
+                    .image(x, y, key)
+                    .setScale(
+                      cfg.scale && cfg.scale.start ? cfg.scale.start : 1
+                    );
+                  // 物理ボディが利用可能なら速度を与える
+                  if (this.physics && this.physics.add) {
+                    this.physics.add.existing(sprite);
+                    if (sprite.body) {
+                      const angleDeg =
+                        (cfg.angle && cfg.angle.min ? cfg.angle.min : 200) +
+                        Math.random() *
+                          ((cfg.angle && cfg.angle.max ? cfg.angle.max : 340) -
+                            (cfg.angle && cfg.angle.min ? cfg.angle.min : 200));
+                      const angle = Phaser.Math.DegToRad(angleDeg);
+                      const speedMin =
+                        cfg.speed && cfg.speed.min ? cfg.speed.min : -100;
+                      const speedMax =
+                        cfg.speed && cfg.speed.max ? cfg.speed.max : 100;
+                      const speed =
+                        speedMin + Math.random() * (speedMax - speedMin);
+                      sprite.body.velocity.x = Math.cos(angle) * speed;
+                      sprite.body.velocity.y = Math.sin(angle) * speed;
+                      if (cfg.gravityY) sprite.body.setGravityY(cfg.gravityY);
+                    }
+                  } else {
+                    // 物理が無い場合は簡易的にランダム移動させる
+                    const dx = (Math.random() - 0.5) * 200;
+                    const dy = (Math.random() - 0.5) * 200;
+                    this.tweens.add({
+                      targets: sprite,
+                      x: x + dx,
+                      y: y + dy,
+                      alpha: 0,
+                      duration: cfg.lifespan || 400,
+                      onComplete: () => sprite.destroy(),
+                    });
+                  }
+                  // 物理対応なら lifespan 後に破棄
+                  if (this.time) {
+                    this.time.delayedCall(cfg.lifespan || 400, () => {
+                      if (sprite && sprite.destroy) sprite.destroy();
+                    });
+                  }
+                }
+              },
+            };
+          };
+
+          this.seedEmitter = createCompatEmitter("seed", {
+            speed: { min: -180, max: 180 },
+            angle: { min: 200, max: 340 },
+            gravityY: 500,
+            lifespan: 400,
+            quantity: 6,
+            scale: { start: 1, end: 0 },
+            on: false,
+          });
+          this.juiceEmitter = createCompatEmitter("juice", {
+            speed: { min: -140, max: 140 },
+            lifespan: 240,
+            quantity: 10,
+            scale: { start: 1, end: 0 },
+            on: false,
+          });
+
+          this.hud = this.add.text(12, 10, "KILLS: 0", {
+            fontFamily: "monospace",
+            fontSize: "20px",
+            color: "#fff",
+          });
+          this.hud2 = this.add.text(12, 34, "FEVER: 0", {
+            fontFamily: "monospace",
+            fontSize: "16px",
+            color: "#a7fffb",
+          });
+
+          this.cursors = this.input.keyboard.createCursorKeys();
+          this.keys = this.input.keyboard.addKeys("W,A,S,D,SPACE");
+
+          this.physics.add.overlap(
+            this.bullets,
+            this.enemies,
+            this.onHitEnemy,
+            null,
+            this
+          );
+          this.physics.add.overlap(
+            this.player,
+            this.enemies,
+            this.onPlayerHit,
+            null,
+            this
+          );
+          this.physics.add.overlap(
+            this.player,
+            this.enemyBullets,
+            this.onPlayerHit,
+            null,
+            this
+          );
+          this.physics.add.overlap(
+            this.player,
+            this.powerups,
+            this.onPickup,
+            null,
+            this
+          );
+
+          this.cameras.main.flash(300, 255, 255, 255);
+        }
+
+        spawnEnemy() {
+          const x = 40 + Math.random() * (W - 80);
+          const y = -40;
+          const e = this.enemies.get(x, y, "enemy");
+          if (!e) return;
+          e.setActive(true).setVisible(true);
+          e.hp = Math.ceil(ENEMY_HP_BASE * this.difficulty);
+          e.pattern = Phaser.Math.Between(0, 2);
+          e.baseX = x;
+          e.t = 0;
+          e.setVelocity(0, ENEMY_BASE_SPEED * this.difficulty);
+          e.lastShot = 0;
+          // choose shooting behavior randomly: single (default), radial burst, or big shot
+          const r = Math.random();
+          if (r < 0.12) e.shooterType = "radial";
+          else if (r < 0.28) e.shooterType = "big";
+          else e.shooterType = "single";
+        }
+
+        enemyShoot(e) {
+          // handle different shooter types
+          if (e.shooterType === "radial") {
+            const count = 12;
+            const speed = 140 * this.difficulty;
+            for (let i = 0; i < count; i++) {
+              const a =
+                ((Math.PI * 2) / count) * i + (Math.random() - 0.5) * 0.06;
+              const bb = this.enemyBullets.get(e.x, e.y + 10, "juice");
+              if (!bb) continue;
+              bb.setActive(true).setVisible(true).setScale(1.2);
+              if (bb.body) {
+                try {
+                  if (typeof bb.body.setCircle === "function")
+                    bb.body.setCircle(6, 2, 2);
+                  else if (typeof bb.body.setSize === "function")
+                    bb.body.setSize(10, 10, true);
+                } catch (er) {}
+              }
+              this.physics.velocityFromRotation(a, speed, bb.body.velocity);
+              bb.setBlendMode(Phaser.BlendModes.ADD);
+              bb._expireAt = this.time.now + 2800;
+            }
+            return;
+          } else if (e.shooterType === "big") {
+            const bb = this.enemyBullets.get(e.x, e.y + 10, "juice");
+            if (!bb) return;
+            bb.setActive(true).setVisible(true);
+            bb.setScale(3.0);
+            if (bb.body) {
+              try {
+                // use display size to set an even tighter hitbox centered on the sprite
+                const w = bb.displayWidth || 10 * (bb.scaleX || 3);
+                const h = bb.displayHeight || 10 * (bb.scaleY || 3);
+                // shrink factor lowered to 0.25 for stricter hitbox
+                const hitW = Math.max(4, Math.round(w * 0.25));
+                const hitH = Math.max(4, Math.round(h * 0.25));
+                if (typeof bb.body.setSize === "function") {
+                  bb.body.setSize(hitW, hitH, true);
+                  // center offset where supported
+                  if (typeof bb.body.setOffset === "function") {
+                    const offX = Math.round(
+                      ((bb.displayWidth || bb.width) - hitW) / 2
+                    );
+                    const offY = Math.round(
+                      ((bb.displayHeight || bb.height) - hitH) / 2
+                    );
+                    try {
+                      bb.body.setOffset(offX, offY);
+                    } catch (er) {}
+                  }
+                } else if (typeof bb.body.setCircle === "function") {
+                  const r = Math.max(3, Math.round(Math.min(hitW, hitH) / 2));
+                  const ox = Math.round(
+                    ((bb.displayWidth || bb.width) - r * 2) / 2
+                  );
+                  const oy = Math.round(
+                    ((bb.displayHeight || bb.height) - r * 2) / 2
+                  );
+                  bb.body.setCircle(r, ox, oy);
+                }
+              } catch (er) {}
+            }
+            const ang = Math.PI / 2 + (Math.random() - 0.5) * 0.2;
+            this.physics.velocityFromRotation(
+              ang,
+              120 * this.difficulty,
+              bb.body.velocity
+            );
+            bb.setBlendMode(Phaser.BlendModes.ADD);
+            bb._expireAt = this.time.now + 3200;
+            return;
+          }
+          // default: single randomized shot
+          const b = this.enemyBullets.get(e.x, e.y + 10, "juice");
+          if (!b) return;
+          b.setActive(true).setVisible(true);
+          b.setScale(1.8);
+          // randomize firing angle slightly so bullets are not perfectly straight
+          const spread = 0.5; // radians (~28 deg) total spread
+          const angle = Math.PI / 2 + (Math.random() - 0.5) * spread;
+          this.physics.velocityFromRotation(
+            angle,
+            180 * this.difficulty,
+            b.body.velocity
+          );
+          if (typeof b.setAngle === "function")
+            b.setAngle(Phaser.Math.RadToDeg(angle));
+          if (b.body) {
+            try {
+              if (typeof b.body.setCircle === "function")
+                b.body.setCircle(6, 2, 2);
+              else if (typeof b.body.setSize === "function")
+                b.body.setSize(10, 10, true);
+            } catch (er) {}
+          }
+          b.setBlendMode(Phaser.BlendModes.ADD);
+          b._expireAt = this.time.now + 2400;
+        }
+
+        fire() {
+          const now = this.time.now;
+          const isHyper = now - this.lastHyper < 1000;
+          const rate = isHyper
+            ? HYPER_RATE
+            : this.inFever
+            ? FIRE_RATE * 0.55
+            : FIRE_RATE;
+          if (now - this.lastFire < rate) return;
+
+          const spread = this.inFever ? [-0.18, 0, 0.18] : [0];
+          spread.forEach((angle) => {
+            const b = this.bullets.get(
+              this.player.x,
+              this.player.y - 12,
+              "tomatoBullet"
+            );
+            if (!b) return;
+            // ensure physics body is enabled and position reset when reusing pooled object
+            b.setActive(true).setVisible(true);
+            if (b.body) {
+              // reset body position and re-enable
+              if (typeof b.body.reset === "function")
+                b.body.reset(this.player.x, this.player.y - 12);
+              b.body.enable = true;
+              // tighten bullet hitbox (smaller than texture)
+              try {
+                if (typeof b.body.setCircle === "function")
+                  b.body.setCircle(8, 8, 8);
+                else if (typeof b.body.setSize === "function")
+                  b.body.setSize(12, 12, true);
+              } catch (e) {
+                /* ignore */
+              }
+            } else {
+              // fallback: add physics body if missing
+              this.physics.add.existing(b);
+            }
+            b.setPosition(this.player.x, this.player.y - 12);
+            b.setAngle(Phaser.Math.RadToDeg(angle));
+            const speed = BULLET_SPEED * (this.inFever ? 1.15 : 1);
+            if (b.body) {
+              b.body.velocity.x = Math.sin(angle) * speed;
+              b.body.velocity.y = -Math.cos(angle) * speed;
+            } else {
+              if (typeof b.setVelocity === "function")
+                b.setVelocity(
+                  Math.sin(angle) * speed,
+                  -Math.cos(angle) * speed
+                );
+            }
+            // use explicit expire timestamp to avoid orphaned timers from previous uses
+            b._expireAt = this.time.now + BULLET_LIFETIME;
+            this.cameras.main.shake(25, 0.0015);
+          });
+          this.lastFire = now;
+        }
+
+        onHitEnemy(bullet, enemy) {
+          bullet.disableBody(true, true);
+          enemy.hp -= 1;
+
+          this.seedEmitter.explode(10, enemy.x, enemy.y);
+          this.juiceEmitter.explode(8, enemy.x, enemy.y);
+          this.cameras.main.flash(60, 255, 60, 60, false);
+
+          if (enemy.hp <= 0) {
+            enemy.disableBody(true, true);
+            this.kills++;
+            this.consecHits++;
+            this.hud.setText(`KILLS: ${this.kills}`);
+
+            if (Math.random() < 0.08) {
+              const p = this.powerups.get(enemy.x, enemy.y, "tomatoBullet");
+              if (p) {
+                p.setActive(true).setVisible(true);
+                p.setScale(0.9);
+                p.isBoost = true;
+                this.physics.moveTo(p, enemy.x, H + 50, 80);
+              }
+            }
+            if (!this.inFever && this.consecHits >= FEVER_THRESHOLD) {
+              this.inFever = true;
+              this.feverUntil = this.time.now + FEVER_DURATION;
+              this.cameras.main.shake(200, 0.006);
+            }
+          }
+        }
+
+        onPickup(player, p) {
+          p.disableBody(true, true);
+          this.inFever = true;
+          this.feverUntil = Math.max(this.feverUntil, this.time.now + 2000);
+          this.cameras.main.shake(150, 0.004);
+        }
+
+        onPlayerHit(player, source) {
+          // debug: log what hit the player and when
+          try {
+            const key =
+              source && source.texture
+                ? source.texture.key
+                : source && source.constructor
+                ? source.constructor.name
+                : String(source);
+            console.log("onPlayerHit", {
+              time: this.time ? this.time.now : Date.now(),
+              sourceKey: key,
+              sx: source && source.x,
+              sy: source && source.y,
+            });
+          } catch (e) {
+            console.log("onPlayerHit logging failed", e);
+          }
+          if (this.gameOver) return;
+          this.gameOver = true;
+          this.physics.world.pause();
+          this.player.setTint(0xff0000);
+          this.cameras.main.shake(400, 0.01);
+          this.time.delayedCall(450, () => this.endGame());
+        }
+
+        endGame() {
+          const best = Number(localStorage.getItem("tomato_best") || 0);
+          const newBest = Math.max(best, this.kills);
+          localStorage.setItem("tomato_best", newBest);
+
+          this.add
+            .rectangle(W / 2, H / 2, W * 0.8, 280, 0x000000, 0.75)
+            .setStrokeStyle(2, 0xffffff, 0.6);
+          this.add
+            .text(W / 2, H / 2 - 80, "GAME OVER", {
+              fontFamily: "monospace",
+              fontSize: "40px",
+              color: "#fff",
+            })
+            .setOrigin(0.5);
+          this.add
+            .text(W / 2, H / 2 - 10, `撃破数  ${this.kills}`, {
+              fontFamily: "monospace",
+              fontSize: "28px",
+              color: "#ffdddd",
+            })
+            .setOrigin(0.5);
+          this.add
+            .text(W / 2, H / 2 + 40, `自己ベスト  ${newBest}`, {
+              fontFamily: "monospace",
+              fontSize: "22px",
+              color: "#a7fffb",
+            })
+            .setOrigin(0.5);
+          this.add
+            .text(W / 2, H / 2 + 96, "Press R to Retry", {
+              fontFamily: "monospace",
+              fontSize: "18px",
+              color: "#fff",
+            })
+            .setOrigin(0.5);
+
+          this.input.keyboard.once("keydown-R", () => this.scene.restart());
+        }
+
+        update(time, delta) {
+          // faster background scroll for speed feeling
+          this.bgScroll.tilePositionY -= 1.2 + (this.difficulty - 1) * 0.4;
+          if (this.gameOver) return;
+
+          if (time - this.lastDiffStep > DIFFICULTY_STEP_MS) {
+            this.lastDiffStep = time;
+            this.difficulty *= DIFFICULTY_GROWTH;
+          }
+
+          let vx = 0,
+            vy = 0;
+          if (this.cursors.left.isDown || this.keys.A.isDown) vx -= 1;
+          if (this.cursors.right.isDown || this.keys.D.isDown) vx += 1;
+          if (this.cursors.up.isDown || this.keys.W.isDown) vy -= 1;
+          if (this.cursors.down.isDown || this.keys.S.isDown) vy += 1;
+          const spd = PLAYER_SPEED * (this.inFever ? 1.05 : 1);
+          this.player.setVelocity(vx * spd, vy * spd);
+
+          if (
+            Phaser.Input.Keyboard.JustDown(this.keys.SPACE) &&
+            time - this.lastHyper > HYPER_COOLDOWN
+          ) {
+            this.lastHyper = time;
+            this.cameras.main.shake(180, 0.004);
+          }
+
+          this.fire();
+
+          if (this.inFever && time > this.feverUntil) {
+            this.inFever = false;
+            this.consecHits = 0;
+          }
+          this.hud2.setText(
+            `FEVER: ${
+              this.inFever ? "ON" : this.consecHits + "/" + FEVER_THRESHOLD
+            }`
+          );
+
+          if (time > this.nextSpawn) {
+            this.nextSpawn = time + SPAWN_INTERVAL / this.difficulty;
+            const n = 1 + Math.floor(Math.min(4, this.difficulty - 1));
+            for (let i = 0; i < n; i++) this.spawnEnemy();
+          }
+
+          this.enemies.children.iterate((e) => {
+            if (!e || !e.active) return;
+            e.t += delta / 1000;
+            if (e.pattern === 1) {
+              e.x = e.baseX + Math.sin(e.t * 3.2) * 60;
+            } else if (e.pattern === 2) {
+              e.x = e.baseX + Math.sin(e.t * 5.0) * 24;
+              e.body.velocity.y = ENEMY_BASE_SPEED * 1.4 * this.difficulty;
+            }
+            if (e.y > H + 40) e.disableBody(true, true);
+
+            if (
+              Math.random() < 0.007 * this.difficulty &&
+              time - e.lastShot > 700
+            ) {
+              e.lastShot = time;
+              this.enemyShoot(e);
+            }
+          });
+
+          this.enemyBullets.children.iterate((b) => {
+            if (!b || !b.active) return;
+            if (b.y > H + 40) b.disableBody(true, true);
+          });
+          // bullets: expire by lifetime or when out of bounds
+          this.bullets.children.iterate((b) => {
+            if (!b || !b.active) return;
+            if (b.y < -40) return b.disableBody(true, true);
+            if (this.time.now > (b._expireAt || 0))
+              return b.disableBody(true, true);
+          });
+        }
+      } // <-- Add this closing brace for the GameScene class
+      const config = {
+        type: Phaser.AUTO,
+        width: W,
+        height: H,
+        backgroundColor: "#06111c",
+        physics: { default: "arcade", arcade: { debug: false } },
+        scene: [GameScene],
+      };
+      const game = new Phaser.Game(config);
+      // handle window resize: update game size and internal W/H
+      window.addEventListener("resize", () => {
+        W = window.innerWidth || W;
+        H = window.innerHeight || H;
+        try {
+          game.scale.resize(W, H);
+        } catch (e) {}
+      });
+    </script>
+  </body>
+</html>
