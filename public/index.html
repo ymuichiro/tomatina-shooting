@@ -18,7 +18,7 @@
     </style>
   </head>
   <body>
-    <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.0/dist/phaser.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.90.0/dist/phaser.min.js"></script>
     <script>
       // Use dynamic size based on browser window
       let W = window.innerWidth || 480;
@@ -36,6 +36,12 @@
       const FEVER_DURATION = 3000;
       const HYPER_RATE = 40;
       const HYPER_COOLDOWN = 4500;
+      const SUPER_DURATION = 4200;
+      const SUPER_BURST_COUNT = 36;
+      const SUPER_BULLET_SPEED = 620;
+      const CLEANUP_INTERVAL_MS = 3000;
+      const POWERUP_LIFETIME = 8000; // ms after which a powerup despawns
+      const ENEMY_BULLET_LIFETIME = 8000; // 全ての敵弾寿命 (ms)
       // === テクスチャ作成関数 ===
       function makeTomatoTexture(scene) {
         const g = scene.make.graphics({ x: 0, y: 0, add: false });
@@ -105,6 +111,29 @@
         g.generateTexture("juice", 10, 10);
         g.destroy();
       }
+      function makeSuperItemTexture(scene) {
+        const g = scene.make.graphics({ x: 0, y: 0, add: false });
+        // star-like yellow item
+        g.fillStyle(0xffdd55, 1);
+        // draw a simple 5-point star
+        const cx = 12,
+          cy = 12,
+          rOuter = 10,
+          rInner = 4;
+        g.beginPath();
+        for (let i = 0; i < 10; i++) {
+          const angle = (Math.PI * 2 * i) / 10 - Math.PI / 2;
+          const r = i % 2 === 0 ? rOuter : rInner;
+          const x = cx + Math.cos(angle) * r;
+          const y = cy + Math.sin(angle) * r;
+          if (i === 0) g.moveTo(x, y);
+          else g.lineTo(x, y);
+        }
+        g.closePath();
+        g.fillPath();
+        g.generateTexture("superItem", 24, 24);
+        g.destroy();
+      }
       function makeBackground(scene) {
         const g = scene.make.graphics({ x: 0, y: 0, add: false });
         g.fillStyle(0x0b0f1a, 1);
@@ -130,16 +159,24 @@
           this.feverUntil = 0;
           this.lastFire = 0;
           this.lastHyper = -9999;
+          // timestamp of last boss spawn to avoid immediate respawn
+          this.lastBossSpawn = -9999;
+          // boss spawn tracking
+          this.boss1Spawned = false;
+          this.boss2Spawned = false;
+          // for periodic boss status logging
+          this._lastBossLog = 0;
           this.nextSpawn = 0;
           this.difficulty = 1.0;
           this.lastDiffStep = 0;
           this.gameOver = false;
         }
-        preload() {}
         preload() {
-          // load background music
+          // load background music and boss images
           try {
             this.load.audio("bgm", "music.mp3");
+            this.load.image("boss1", "boss1.png");
+            this.load.image("boss2", "boss2.webp");
           } catch (e) {}
         }
         create() {
@@ -147,41 +184,53 @@
           W = window.innerWidth || W;
           H = window.innerHeight || H;
           makeBackground(this);
-          // play background music if available
+          // play background music if available (single instance across restarts)
           try {
-            this.sound &&
-              this.sound.add &&
-              this.sound.add("bgm", { loop: true, volume: 0.5 }).play();
+            if (this.sound && typeof this.sound.add === "function") {
+              // use a window-global to avoid creating multiple Sound instances on scene restart
+              try {
+                const existing = window.__tomato_bgm;
+                if (!existing) {
+                  // create and keep a reference globally
+                  window.__tomato_bgm = this.sound.add("bgm", {
+                    loop: true,
+                    volume: 0.5,
+                  });
+                }
+                // play if not already playing
+                try {
+                  if (window.__tomato_bgm && !window.__tomato_bgm.isPlaying)
+                    window.__tomato_bgm.play();
+                } catch (e) {
+                  // some environments may not support isPlaying; try play() anyway
+                  try {
+                    window.__tomato_bgm && window.__tomato_bgm.play();
+                  } catch (ee) {}
+                }
+              } catch (e) {}
+            }
           } catch (e) {}
           makeTomatoTexture(this);
           makeEnemyTexture(this);
           makePlayerTexture(this);
           makeSeedParticle(this);
           makeJuiceParticle(this);
+          makeSuperItemTexture(this);
           this.add.image(W / 2, H / 2, "bg").setDepth(-10);
           this.bgScroll = this.add
             .tileSprite(W / 2, H / 2, W, H, "bg")
             .setAlpha(0.25)
             .setDepth(-9);
 
-          this.player = this.physics.add
-            .image(W / 2, H - 80, "player")
-            .setCollideWorldBounds(true);
-          // tighten player hitbox to better match visible sprite
-          if (
-            this.player.body &&
-            typeof this.player.body.setSize === "function"
-          ) {
-            this.player.body.setSize(20, 14, true);
-          }
-
+          this.player = this.physics.add.image(W / 2, H - 80, "player");
+          // pools: player bullets, enemies, enemy bullets, powerups
           this.bullets = this.physics.add.group({
             classType: Phaser.Physics.Arcade.Image,
-            maxSize: 400,
+            maxSize: 120, // allow room for super burst + regular fire
           });
           this.enemies = this.physics.add.group({
             classType: Phaser.Physics.Arcade.Image,
-            maxSize: 120,
+            maxSize: 64,
           });
           this.enemyBullets = this.physics.add.group({
             classType: Phaser.Physics.Arcade.Image,
@@ -189,7 +238,7 @@
           });
           this.powerups = this.physics.add.group({
             classType: Phaser.Physics.Arcade.Image,
-            maxSize: 6,
+            maxSize: 12,
           });
 
           // 互換性対応: Phaser の createEmitter が存在すればそれを使い、無ければ簡易フォールバックを提供
@@ -283,7 +332,25 @@
             color: "#a7fffb",
           });
 
+          // lightweight flash overlay for controlled opacity flashes
+          try {
+            this.flashRect = this.add
+              .rectangle(0, 0, W, H, 0xffc8c8, 0)
+              .setOrigin(0, 0)
+              .setDepth(20)
+              .setScrollFactor(0)
+              .setVisible(true);
+            // ensure size matches
+            if (typeof this.flashRect.setDisplaySize === "function")
+              this.flashRect.setDisplaySize(W, H);
+          } catch (e) {}
+
           this.cursors = this.input.keyboard.createCursorKeys();
+          this.hud3 = this.add.text(12, 56, "SUPER: OFF", {
+            fontFamily: "monospace",
+            fontSize: "16px",
+            color: "#ffd37a",
+          });
           this.keys = this.input.keyboard.addKeys("W,A,S,D,SPACE");
 
           this.physics.add.overlap(
@@ -315,6 +382,19 @@
             this
           );
 
+          // periodic cleanup to avoid stuck/inactive projectiles lingering
+          try {
+            this.time.addEvent({
+              delay: CLEANUP_INTERVAL_MS,
+              loop: true,
+              callback: () => {
+                try {
+                  this.cleanupProjectiles();
+                } catch (e) {}
+              },
+            });
+          } catch (e) {}
+
           this.cameras.main.flash(300, 255, 255, 255);
         }
 
@@ -322,8 +402,23 @@
           const x = 40 + Math.random() * (W - 80);
           const y = -40;
           const e = this.enemies.get(x, y, "enemy");
-          if (!e) return;
+          if (!e) {
+            try {
+              console.warn(
+                "spawnEnemy: enemy pool exhausted or no free object",
+                { time: this.time ? this.time.now : Date.now() }
+              );
+            } catch (err) {}
+            return;
+          }
           e.setActive(true).setVisible(true);
+          // ensure physics body is reset and enabled when reusing pooled enemy
+          if (e.body) {
+            try {
+              if (typeof e.body.reset === "function") e.body.reset(x, y);
+              e.body.enable = true;
+            } catch (err) {}
+          }
           e.hp = Math.ceil(ENEMY_HP_BASE * this.difficulty);
           e.pattern = Phaser.Math.Between(0, 2);
           e.baseX = x;
@@ -337,6 +432,449 @@
           else e.shooterType = "single";
         }
 
+        // spawn boss1 entity
+        spawnBoss1() {
+          try {
+            // create a physics-enabled sprite for boss1
+            const x = W / 2;
+            const y = -140;
+            const b = this.physics.add.image(x, y, "boss1");
+            b.setOrigin(0.5, 0.5);
+            b.setDepth(5);
+            b.setScale(Math.min(1.4, Math.max(0.8, W / 900)));
+            if (b.body && typeof b.body.setSize === "function") {
+              try {
+                b.body.setSize(
+                  Math.round(b.displayWidth * 0.8),
+                  Math.round(b.displayHeight * 0.7),
+                  true
+                );
+              } catch (e) {}
+            }
+            b.hp = 20; // Boss1 has more HP
+            b.maxHp = 500;
+            b.lastShot = 0;
+            b.bossType = "boss1";
+            // prevent multiple simultaneous hits from counting as separate damage
+            b.lastHit = -9999;
+            this.boss = b;
+            this.boss1Spawned = true;
+            // ensure boss starts active/visible and body enabled
+            try {
+              if (typeof b.setActive === "function") b.setActive(true);
+              if (typeof b.setVisible === "function") b.setVisible(true);
+              if (b.body) b.body.enable = true;
+            } catch (e) {}
+            // protect boss from being accidentally disabled/destroyed by other logic
+            this.protectBoss(b);
+            // move into view
+            this.tweens.add({
+              targets: b,
+              y: 120,
+              duration: 1200,
+              ease: "Sine.easeOut",
+            });
+            // overlap player bullets -> boss
+            this.physics.add.overlap(
+              this.bullets,
+              b,
+              this.onHitBoss,
+              null,
+              this
+            );
+            // entrance effect
+            this.cameras.main.shake(220, 0.005);
+            this.showBossHealthBar(b);
+          } catch (e) {
+            console.log("spawnBoss1 failed:", e);
+          }
+        }
+
+        // spawn boss2 entity
+        spawnBoss2() {
+          try {
+            // create a physics-enabled sprite for boss2
+            const x = W / 2;
+            const y = -140;
+            const b = this.physics.add.image(x, y, "boss2");
+            b.setOrigin(0.5, 0.5);
+            b.setDepth(5);
+            b.setScale(Math.min(1.6, Math.max(1.0, W / 800)));
+            if (b.body && typeof b.body.setSize === "function") {
+              try {
+                b.body.setSize(
+                  Math.round(b.displayWidth * 0.8),
+                  Math.round(b.displayHeight * 0.7),
+                  true
+                );
+              } catch (e) {}
+            }
+            b.hp = 50; // Boss2 has much more HP
+            b.maxHp = 1000;
+            b.lastShot = 0;
+            b.bossType = "boss2";
+            // prevent multiple simultaneous hits from counting as separate damage
+            b.lastHit = -9999;
+            this.boss = b;
+            this.boss2Spawned = true;
+            // ensure boss starts active/visible and body enabled
+            try {
+              if (typeof b.setActive === "function") b.setActive(true);
+              if (typeof b.setVisible === "function") b.setVisible(true);
+              if (b.body) b.body.enable = true;
+            } catch (e) {}
+            // protect boss from being accidentally disabled/destroyed by other logic
+            this.protectBoss(b);
+            // move into view
+            this.tweens.add({
+              targets: b,
+              y: 100,
+              duration: 1500,
+              ease: "Sine.easeOut",
+            });
+            // overlap player bullets -> boss
+            this.physics.add.overlap(
+              this.bullets,
+              b,
+              this.onHitBoss,
+              null,
+              this
+            );
+            // stronger entrance effect for boss2
+            this.cameras.main.shake(300, 0.008);
+            this.showBossHealthBar(b);
+          } catch (e) {
+            console.log("spawnBoss2 failed:", e);
+          }
+        }
+
+        // protect boss from accidental disable/destroy
+        protectBoss(b) {
+          try {
+            b.__allowDisable = false;
+            b.__allowDestroy = false;
+            if (typeof b.disableBody === "function") {
+              b._origDisableBody = b.disableBody.bind(b);
+              b.disableBody = function () {
+                if (this.__allowDisable)
+                  return this._origDisableBody.apply(this, arguments);
+              };
+            }
+            if (typeof b.destroy === "function") {
+              b._origDestroy = b.destroy.bind(b);
+              b.destroy = function () {
+                if (this.__allowDestroy)
+                  return this._origDestroy.apply(this, arguments);
+              };
+            }
+          } catch (e) {}
+        }
+
+        // show boss health bar
+        showBossHealthBar(boss) {
+          try {
+            if (this.bossHealthBar) {
+              this.bossHealthBar.destroy();
+            }
+            if (this.bossHealthText) {
+              this.bossHealthText.destroy();
+            }
+
+            // health bar background
+            this.bossHealthBg = this.add
+              .rectangle(W / 2, 30, 300, 12, 0x333333)
+              .setStrokeStyle(2, 0xffffff, 0.8);
+
+            // health bar fill
+            this.bossHealthBar = this.add.rectangle(
+              W / 2,
+              30,
+              296,
+              8,
+              0xff4444
+            );
+
+            // boss name text
+            const bossName = boss.bossType === "boss1" ? "BOSS 1" : "BOSS 2";
+            this.bossHealthText = this.add
+              .text(W / 2, 15, bossName, {
+                fontFamily: "monospace",
+                fontSize: "16px",
+                color: "#fff",
+              })
+              .setOrigin(0.5);
+
+            // set depth
+            this.bossHealthBg.setDepth(15);
+            this.bossHealthBar.setDepth(16);
+            this.bossHealthText.setDepth(17);
+          } catch (e) {
+            console.log("showBossHealthBar failed:", e);
+          }
+        }
+
+        // update boss health bar
+        updateBossHealthBar(boss) {
+          try {
+            if (this.bossHealthBar && boss && boss.hp && boss.maxHp) {
+              const healthPercent = Math.max(0, boss.hp / boss.maxHp);
+              this.bossHealthBar.displayWidth = 296 * healthPercent;
+              // change color based on health
+              if (healthPercent > 0.6) {
+                this.bossHealthBar.setFillStyle(0xff4444);
+              } else if (healthPercent > 0.3) {
+                this.bossHealthBar.setFillStyle(0xffaa44);
+              } else {
+                this.bossHealthBar.setFillStyle(0xff8888);
+              }
+            }
+          } catch (e) {}
+        }
+
+        // hide boss health bar
+        hideBossHealthBar() {
+          try {
+            if (this.bossHealthBg) this.bossHealthBg.destroy();
+            if (this.bossHealthBar) this.bossHealthBar.destroy();
+            if (this.bossHealthText) this.bossHealthText.destroy();
+            this.bossHealthBg = null;
+            this.bossHealthBar = null;
+            this.bossHealthText = null;
+          } catch (e) {}
+        }
+
+        bossShoot(b) {
+          if (!b) return;
+
+          // Different attack patterns for different bosses
+          if (b.bossType === "boss1") {
+            // Boss1: Circular spread
+            const count = 12;
+            for (let i = 0; i < count; i++) {
+              const a =
+                (Math.PI * 2 * i) / count + (Math.random() - 0.5) * 0.15;
+              this.createBossbullet(
+                b,
+                a,
+                170 * this.difficulty,
+                1.5,
+                ENEMY_BULLET_LIFETIME
+              );
+            }
+          } else if (b.bossType === "boss2") {
+            // Boss2: Double spiral pattern
+            const count = 16;
+            const time = this.time.now * 0.005;
+            for (let i = 0; i < count; i++) {
+              const baseAngle = (Math.PI * 2 * i) / count;
+              const spiralAngle = baseAngle + time;
+              this.createBossbullet(
+                b,
+                spiralAngle,
+                180 * this.difficulty,
+                2.0,
+                ENEMY_BULLET_LIFETIME
+              );
+            }
+            // Additional targeted shots at player
+            if (this.player) {
+              const angleToPlayer = Phaser.Math.Angle.Between(
+                b.x,
+                b.y,
+                this.player.x,
+                this.player.y
+              );
+              for (let i = 0; i < 3; i++) {
+                const spread = (i - 1) * 0.3;
+                this.createBossbullet(
+                  b,
+                  angleToPlayer + spread,
+                  220 * this.difficulty,
+                  1.8,
+                  ENEMY_BULLET_LIFETIME
+                );
+              }
+            }
+          } else {
+            // Default boss pattern
+            const count = 10;
+            for (let i = 0; i < count; i++) {
+              const a =
+                (Math.PI * 2 * i) / count + (Math.random() - 0.5) * 0.18;
+              this.createBossbullet(
+                b,
+                a,
+                160 * this.difficulty,
+                1.5,
+                ENEMY_BULLET_LIFETIME
+              );
+            }
+          }
+        }
+
+        createBossbullet(boss, angle, speed, scale, lifetime) {
+          let bb = this.enemyBullets.get(boss.x, boss.y + 10, "juice");
+          if (!bb) {
+            try {
+              bb = this.physics.add.image(boss.x, boss.y + 10, "juice");
+            } catch (e) {
+              return;
+            }
+          }
+          bb.setActive(true).setVisible(true).setScale(scale);
+          if (bb.body) {
+            try {
+              if (typeof bb.body.reset === "function")
+                bb.body.reset(boss.x, boss.y + 10);
+              bb.body.enable = true;
+              if (typeof bb.body.setCircle === "function")
+                bb.body.setCircle(4, 3, 3);
+              // small tight circle for boss bullets
+              else if (typeof bb.body.setSize === "function")
+                bb.body.setSize(8, 8, true);
+            } catch (e) {}
+          }
+          try {
+            if (bb.body && bb.body.velocity) {
+              this.physics.velocityFromRotation(angle, speed, bb.body.velocity);
+              // persist velocity so we can reapply if physics stops updating
+              try {
+                bb._vx = bb.body.velocity.x;
+                bb._vy = bb.body.velocity.y;
+              } catch (e) {}
+            } else if (typeof bb.setVelocity === "function") {
+              const vx = Math.cos(angle) * speed;
+              const vy = Math.sin(angle) * speed;
+              bb.setVelocity(vx, vy);
+              try {
+                bb._vx = vx;
+                bb._vy = vy;
+              } catch (e) {}
+            }
+          } catch (e) {}
+          if (typeof bb.setBlendMode === "function")
+            bb.setBlendMode(Phaser.BlendModes.ADD);
+          bb._expireAt = this.time.now + lifetime;
+        }
+
+        onHitBoss(bullet, boss) {
+          try {
+            const nowt = this.time ? this.time.now : Date.now();
+            // onHitBoss: debug log suppressed
+
+            if (bullet && bullet.disableBody) bullet.disableBody(true, true);
+
+            // canonical boss: prefer this.boss when present
+            const canonical = this.boss || boss;
+            if (!canonical) return;
+
+            // ignore if boss was hit very recently (prevent multi-hit)
+            if (
+              typeof canonical.lastHit === "number" &&
+              nowt - canonical.lastHit < 140
+            ) {
+              // recent hit: ignore to prevent multi-hit
+              return;
+            }
+            canonical.lastHit = nowt;
+
+            // ensure hp default based on boss type
+            let DEFAULT_BOSS_HP = 12;
+            if (canonical.bossType === "boss1") DEFAULT_BOSS_HP = 20;
+            else if (canonical.bossType === "boss2") DEFAULT_BOSS_HP = 50;
+
+            const beforeHp =
+              typeof canonical.hp === "number" ? canonical.hp : DEFAULT_BOSS_HP;
+            canonical.hp = beforeHp - 1;
+
+            // update boss health bar
+            this.updateBossHealthBar(canonical);
+
+            // onHitBoss: canonical hit processed (debug log suppressed)
+
+            // reflect change back to arg object if different
+            try {
+              if (boss && boss !== canonical) {
+                // sync arg hp with canonical
+                boss.hp = canonical.hp;
+              }
+            } catch (e) {}
+
+            // onHitBoss: pre-explode state (debug log suppressed)
+            this.juiceEmitter.explode(12, canonical.x, canonical.y);
+
+            // ensure boss stays visible/active after being hit (unless dying)
+            try {
+              if (canonical.hp > 0) {
+                if (typeof canonical.setActive === "function")
+                  canonical.setActive(true);
+                if (typeof canonical.setVisible === "function")
+                  canonical.setVisible(true);
+                if (canonical.body) canonical.body.enable = true;
+              }
+            } catch (e) {}
+
+            // onHitBoss: post-explode state (debug log suppressed)
+
+            if (canonical.hp <= 0) {
+              // hide boss health bar
+              this.hideBossHealthBar();
+
+              try {
+                if (canonical.disableBody) canonical.disableBody(true, true);
+                if (canonical.destroy) canonical.destroy();
+              } catch (e) {}
+              try {
+                console.log("Boss defeated:", canonical.bossType);
+              } catch (e) {}
+
+              // drop more powerups based on boss type
+              const powerupCount = canonical.bossType === "boss2" ? 8 : 5;
+              for (let i = 0; i < powerupCount; i++) {
+                const p = this.powerups.get(
+                  canonical.x + (i - Math.floor(powerupCount / 2)) * 16,
+                  canonical.y + 8,
+                  "tomatoBullet"
+                );
+                if (p) {
+                  p.setActive(true).setVisible(true);
+                  p.isBoost = true;
+                  // ensure body is reset and enabled before moving
+                  if (p.body) {
+                    try {
+                      if (typeof p.body.reset === "function")
+                        p.body.reset(p.x, p.y);
+                      p.body.enable = true;
+                    } catch (er) {}
+                  }
+                  const speed = 90 + Math.random() * 50;
+                  this.physics.moveTo(p, p.x, H + 80, speed);
+                  try {
+                    if (p.body && p.body.velocity) {
+                      p._vx = p.body.velocity.x;
+                      p._vy = p.body.velocity.y;
+                    }
+                  } catch (er) {}
+                }
+              }
+
+              // allow canonical boss to be disabled/destroyed now
+              try {
+                if (canonical) {
+                  canonical.__allowDisable = true;
+                  canonical.__allowDestroy = true;
+                  if (canonical._origDisableBody)
+                    canonical._origDisableBody(true, true);
+                  if (canonical._origDestroy) canonical._origDestroy();
+                }
+              } catch (e) {}
+              if (this.boss === canonical) this.boss = null;
+            }
+          } catch (e) {
+            console.log("onHitBoss error", e);
+          }
+        }
+
         enemyShoot(e) {
           // handle different shooter types
           if (e.shooterType === "radial") {
@@ -346,37 +884,67 @@
               const a =
                 ((Math.PI * 2) / count) * i + (Math.random() - 0.5) * 0.06;
               const bb = this.enemyBullets.get(e.x, e.y + 10, "juice");
-              if (!bb) continue;
+              if (!bb) {
+                try {
+                  console.warn("enemyShoot: enemyBullets pool exhausted", {
+                    time: this.time ? this.time.now : Date.now(),
+                  });
+                } catch (er) {}
+                continue;
+              }
               bb.setActive(true).setVisible(true).setScale(1.2);
               if (bb.body) {
                 try {
+                  if (typeof bb.body.reset === "function")
+                    bb.body.reset(e.x, e.y + 10);
+                  bb.body.enable = true;
                   if (typeof bb.body.setCircle === "function")
                     bb.body.setCircle(6, 2, 2);
                   else if (typeof bb.body.setSize === "function")
                     bb.body.setSize(10, 10, true);
                 } catch (er) {}
               }
-              this.physics.velocityFromRotation(a, speed, bb.body.velocity);
+              // ensure velocity set and persisted
+              try {
+                if (bb.body && bb.body.velocity) {
+                  this.physics.velocityFromRotation(a, speed, bb.body.velocity);
+                  bb._vx = bb.body.velocity.x;
+                  bb._vy = bb.body.velocity.y;
+                } else if (typeof bb.setVelocity === "function") {
+                  const vx = Math.cos(a) * speed;
+                  const vy = Math.sin(a) * speed;
+                  bb.setVelocity(vx, vy);
+                  bb._vx = vx;
+                  bb._vy = vy;
+                }
+              } catch (er) {}
               bb.setBlendMode(Phaser.BlendModes.ADD);
-              bb._expireAt = this.time.now + 2800;
+              bb._expireAt = this.time.now + ENEMY_BULLET_LIFETIME;
             }
             return;
           } else if (e.shooterType === "big") {
             const bb = this.enemyBullets.get(e.x, e.y + 10, "juice");
-            if (!bb) return;
+            if (!bb) {
+              try {
+                console.warn("enemyShoot: enemyBullets pool exhausted (big)", {
+                  time: this.time ? this.time.now : Date.now(),
+                });
+              } catch (er) {}
+              return;
+            }
             bb.setActive(true).setVisible(true);
             bb.setScale(3.0);
             if (bb.body) {
               try {
-                // use display size to set an even tighter hitbox centered on the sprite
+                if (typeof bb.body.reset === "function")
+                  bb.body.reset(e.x, e.y + 10);
+                bb.body.enable = true;
                 const w = bb.displayWidth || 10 * (bb.scaleX || 3);
                 const h = bb.displayHeight || 10 * (bb.scaleY || 3);
-                // shrink factor lowered to 0.25 for stricter hitbox
                 const hitW = Math.max(4, Math.round(w * 0.25));
                 const hitH = Math.max(4, Math.round(h * 0.25));
                 if (typeof bb.body.setSize === "function") {
                   bb.body.setSize(hitW, hitH, true);
-                  // center offset where supported
                   if (typeof bb.body.setOffset === "function") {
                     const offX = Math.round(
                       ((bb.displayWidth || bb.width) - hitW) / 2
@@ -401,13 +969,25 @@
               } catch (er) {}
             }
             const ang = Math.PI / 2 + (Math.random() - 0.5) * 0.2;
-            this.physics.velocityFromRotation(
-              ang,
-              120 * this.difficulty,
-              bb.body.velocity
-            );
+            try {
+              if (bb.body && bb.body.velocity) {
+                this.physics.velocityFromRotation(
+                  ang,
+                  120 * this.difficulty,
+                  bb.body.velocity
+                );
+                bb._vx = bb.body.velocity.x;
+                bb._vy = bb.body.velocity.y;
+              } else if (typeof bb.setVelocity === "function") {
+                const vx = Math.cos(ang) * 120 * this.difficulty;
+                const vy = Math.sin(ang) * 120 * this.difficulty;
+                bb.setVelocity(vx, vy);
+                bb._vx = vx;
+                bb._vy = vy;
+              }
+            } catch (er) {}
             bb.setBlendMode(Phaser.BlendModes.ADD);
-            bb._expireAt = this.time.now + 3200;
+            bb._expireAt = this.time.now + ENEMY_BULLET_LIFETIME;
             return;
           }
           // default: single randomized shot
@@ -434,20 +1014,33 @@
             } catch (er) {}
           }
           b.setBlendMode(Phaser.BlendModes.ADD);
-          b._expireAt = this.time.now + 2400;
+          b._expireAt = this.time.now + ENEMY_BULLET_LIFETIME;
         }
 
         fire() {
           const now = this.time.now;
           const isHyper = now - this.lastHyper < 1000;
+          const isSuperNow = this.isSuper && now < (this.superUntil || 0);
           const rate = isHyper
             ? HYPER_RATE
+            : isSuperNow
+            ? FIRE_RATE * 0.35
             : this.inFever
             ? FIRE_RATE * 0.55
             : FIRE_RATE;
           if (now - this.lastFire < rate) return;
 
-          const spread = this.inFever ? [-0.18, 0, 0.18] : [0];
+          // determine spread: super gives wide multi-shot, fever gives 3-way, normal single
+          let spread = [0];
+          if (isSuperNow) {
+            // create 7-shot fan
+            spread = [];
+            const steps = 7;
+            const total = 0.9; // radians spread
+            for (let i = 0; i < steps; i++) {
+              spread.push(-total / 2 + (total * i) / (steps - 1));
+            }
+          } else if (this.inFever) spread = [-0.18, 0, 0.18];
           spread.forEach((angle) => {
             const b = this.bullets.get(
               this.player.x,
@@ -481,12 +1074,20 @@
             if (b.body) {
               b.body.velocity.x = Math.sin(angle) * speed;
               b.body.velocity.y = -Math.cos(angle) * speed;
+              try {
+                b._vx = b.body.velocity.x;
+                b._vy = b.body.velocity.y;
+              } catch (e) {}
             } else {
               if (typeof b.setVelocity === "function")
                 b.setVelocity(
                   Math.sin(angle) * speed,
                   -Math.cos(angle) * speed
                 );
+              try {
+                b._vx = Math.sin(angle) * speed;
+                b._vy = -Math.cos(angle) * speed;
+              } catch (e) {}
             }
             // use explicit expire timestamp to avoid orphaned timers from previous uses
             b._expireAt = this.time.now + BULLET_LIFETIME;
@@ -501,21 +1102,115 @@
 
           this.seedEmitter.explode(10, enemy.x, enemy.y);
           this.juiceEmitter.explode(8, enemy.x, enemy.y);
-          this.cameras.main.flash(60, 255, 60, 60, false);
+          // lighter/paler red flash via overlay at alpha ~0.2
+          try {
+            if (this.flashRect) {
+              this.flashRect.setFillStyle(0xffc8c8, 1);
+              this.flashRect.alpha = 0.2;
+              try {
+                this.tweens.add({
+                  targets: this.flashRect,
+                  alpha: 0,
+                  duration: 140,
+                });
+              } catch (er) {
+                // fallback: instantly hide if tweens not available
+                this.flashRect.alpha = 0;
+              }
+            } else {
+              this.cameras.main.flash(60, 255, 200, 200, false);
+            }
+          } catch (e) {
+            try {
+              this.cameras.main.flash(60, 255, 200, 200, false);
+            } catch (er) {}
+          }
 
           if (enemy.hp <= 0) {
             enemy.disableBody(true, true);
             this.kills++;
+
+            // spawn bosses based on score thresholds
+            try {
+              const nowt = this.time ? this.time.now : Date.now();
+              // Boss1 appears at 100 kills (comment corrected)
+              if (
+                !this.boss &&
+                !this.boss1Spawned &&
+                this.kills >= 100 &&
+                nowt - (this.lastBossSpawn || 0) > 8000
+              ) {
+                this.lastBossSpawn = nowt;
+                this.spawnBoss1();
+              }
+              // Boss2 appears at 300 kills (comment corrected)
+              else if (
+                !this.boss &&
+                !this.boss2Spawned &&
+                this.kills >= 300 &&
+                nowt - (this.lastBossSpawn || 0) > 8000
+              ) {
+                this.lastBossSpawn = nowt;
+                this.spawnBoss2();
+              }
+            } catch (e) {
+              console.log("Boss spawn check failed:", e);
+            }
             this.consecHits++;
             this.hud.setText(`KILLS: ${this.kills}`);
 
             if (Math.random() < 0.08) {
-              const p = this.powerups.get(enemy.x, enemy.y, "tomatoBullet");
-              if (p) {
-                p.setActive(true).setVisible(true);
-                p.setScale(0.9);
-                p.isBoost = true;
-                this.physics.moveTo(p, enemy.x, H + 50, 80);
+              const r = Math.random();
+              if (r < 0.06) {
+                // normal tomato boost
+                const p = this.powerups.get(enemy.x, enemy.y, "tomatoBullet");
+                if (p) {
+                  p.setActive(true).setVisible(true);
+                  p.setScale(0.9);
+                  p.isBoost = true;
+                  p.isSuper = false;
+                  if (p.body) {
+                    try {
+                      if (typeof p.body.reset === "function")
+                        p.body.reset(enemy.x, enemy.y);
+                      p.body.enable = true;
+                    } catch (er) {}
+                  }
+                  const speed = 80;
+                  this.physics.moveTo(p, enemy.x, H + 50, speed);
+                  try {
+                    if (p.body && p.body.velocity) {
+                      p._vx = p.body.velocity.x;
+                      p._vy = p.body.velocity.y;
+                    }
+                  } catch (er) {}
+                  p._expireAt = this.time.now + POWERUP_LIFETIME;
+                }
+              } else {
+                // rarer: super attack item
+                const p = this.powerups.get(enemy.x, enemy.y, "superItem");
+                if (p) {
+                  p.setActive(true).setVisible(true);
+                  p.setScale(0.9);
+                  p.isBoost = false;
+                  p.isSuper = true;
+                  if (p.body) {
+                    try {
+                      if (typeof p.body.reset === "function")
+                        p.body.reset(enemy.x, enemy.y);
+                      p.body.enable = true;
+                    } catch (er) {}
+                  }
+                  const speed = 110;
+                  this.physics.moveTo(p, enemy.x, H + 50, speed);
+                  try {
+                    if (p.body && p.body.velocity) {
+                      p._vx = p.body.velocity.x;
+                      p._vy = p.body.velocity.y;
+                    }
+                  } catch (er) {}
+                  p._expireAt = this.time.now + POWERUP_LIFETIME;
+                }
               }
             }
             if (!this.inFever && this.consecHits >= FEVER_THRESHOLD) {
@@ -527,10 +1222,61 @@
         }
 
         onPickup(player, p) {
+          // consume pickup
           p.disableBody(true, true);
-          this.inFever = true;
-          this.feverUntil = Math.max(this.feverUntil, this.time.now + 2000);
-          this.cameras.main.shake(150, 0.004);
+          if (p.isSuper) {
+            // immediate spectacular burst
+            for (let i = 0; i < SUPER_BURST_COUNT; i++) {
+              const a =
+                (Math.PI * 2 * i) / SUPER_BURST_COUNT +
+                (Math.random() - 0.5) * 0.06;
+              // create tomato bullets in a big circle around player
+              const b = this.bullets.get(
+                this.player.x,
+                this.player.y - 12,
+                "tomatoBullet"
+              );
+              if (!b) continue;
+              b.setActive(true).setVisible(true);
+              if (b.body) {
+                if (typeof b.body.reset === "function")
+                  b.body.reset(this.player.x, this.player.y - 12);
+                b.body.enable = true;
+                try {
+                  if (typeof b.body.setCircle === "function")
+                    b.body.setCircle(8, 8, 8);
+                } catch (e) {}
+              }
+              b.setPosition(this.player.x, this.player.y - 12);
+              b.setAngle(Phaser.Math.RadToDeg(a));
+              const speed = SUPER_BULLET_SPEED;
+              if (b.body) {
+                b.body.velocity.x = Math.sin(a) * speed;
+                b.body.velocity.y = -Math.cos(a) * speed;
+                try {
+                  b._vx = b.body.velocity.x;
+                  b._vy = b.body.velocity.y;
+                } catch (e) {}
+              } else {
+                if (typeof b.setVelocity === "function")
+                  b.setVelocity(Math.sin(a) * speed, -Math.cos(a) * speed);
+                try {
+                  b._vx = Math.sin(a) * speed;
+                  b._vy = -Math.cos(a) * speed;
+                } catch (e) {}
+              }
+              b._expireAt = this.time.now + BULLET_LIFETIME;
+            }
+            // set temporary super state
+            this.isSuper = true;
+            this.superUntil = this.time.now + SUPER_DURATION;
+            this.cameras.main.shake(260, 0.006);
+          } else {
+            // default tomato pickup: fever boost
+            this.inFever = true;
+            this.feverUntil = Math.max(this.feverUntil, this.time.now + 2000);
+            this.cameras.main.shake(150, 0.004);
+          }
         }
 
         onPlayerHit(player, source) {
@@ -557,6 +1303,41 @@
           this.player.setTint(0xff0000);
           this.cameras.main.shake(400, 0.01);
           this.time.delayedCall(450, () => this.endGame());
+        }
+
+        cleanupProjectiles() {
+          try {
+            let cleared = 0;
+            const wipe = (group, name) => {
+              if (!group) return 0;
+              let c = 0;
+              group.children.iterate((o) => {
+                if (!o) return;
+                // only clear objects that are visible but lack a usable physics body
+                try {
+                  const hasBody = !!o.body;
+                  const bodyEnabled = hasBody ? Boolean(o.body.enable) : false;
+                  if (o.active && (!hasBody || bodyEnabled === false)) {
+                    try {
+                      if (o.disableBody) o.disableBody(true, true);
+                      else if (o.destroy) o.destroy();
+                    } catch (er) {}
+                    c++;
+                  }
+                } catch (er) {}
+              });
+              try {
+                if (c > 0) console.log(`cleanup: cleared ${c} ${name}`);
+              } catch (er) {}
+              return c;
+            };
+            cleared += wipe(this.bullets, "playerBullets");
+            cleared += wipe(this.enemyBullets, "enemyBullets");
+            cleared += wipe(this.powerups, "powerups");
+            return cleared;
+          } catch (e) {
+            return 0;
+          }
         }
 
         endGame() {
@@ -632,14 +1413,20 @@
             this.inFever = false;
             this.consecHits = 0;
           }
+          // clear super state when expired
+          if (this.isSuper && time > (this.superUntil || 0)) {
+            this.isSuper = false;
+          }
+          this.hud3.setText(`SUPER: ${this.isSuper ? "ON" : "OFF"}`);
           this.hud2.setText(
             `FEVER: ${
               this.inFever ? "ON" : this.consecHits + "/" + FEVER_THRESHOLD
             }`
           );
 
-          if (time > this.nextSpawn) {
-            this.nextSpawn = time + SPAWN_INTERVAL / this.difficulty;
+          const nowt = this.time ? this.time.now : time;
+          if (nowt > this.nextSpawn) {
+            this.nextSpawn = nowt + SPAWN_INTERVAL / this.difficulty;
             const n = 1 + Math.floor(Math.min(4, this.difficulty - 1));
             for (let i = 0; i < n; i++) this.spawnEnemy();
           }
@@ -655,19 +1442,213 @@
             }
             if (e.y > H + 40) e.disableBody(true, true);
 
-            if (
-              Math.random() < 0.007 * this.difficulty &&
-              time - e.lastShot > 700
-            ) {
-              e.lastShot = time;
-              this.enemyShoot(e);
-            }
+            try {
+              const prob = Math.min(
+                0.18,
+                Math.max(0.002, 0.007 * this.difficulty)
+              );
+              // defensive: if lastShot became invalid, reset so enemies can continue shooting
+              if (!isFinite(e.lastShot)) e.lastShot = 0;
+              const canShoot =
+                typeof e.lastShot === "number" ? time - e.lastShot > 700 : true;
+              if (Math.random() < prob && canShoot) {
+                e.lastShot = time;
+                this.enemyShoot(e);
+              }
+            } catch (er) {}
           });
+
+          // boss AI: simple movement and shooting
+          try {
+            if (this.boss) {
+              // move boss slowly left/right in a sine pattern
+              if (typeof this.boss.t === "undefined") this.boss.t = 0;
+              this.boss.t += delta / 1000;
+              const amp = Math.max(40, Math.min(120, W / 6));
+              this.boss.x = W / 2 + Math.sin(this.boss.t * 0.8) * amp;
+
+              // ensure boss stays within bounds
+              if (this.boss.x < 60) this.boss.x = 60;
+              if (this.boss.x > W - 60) this.boss.x = W - 60;
+
+              // update health bar every frame
+              this.updateBossHealthBar(this.boss);
+
+              // boss shooting: rate depends on boss type
+              const nowt = time;
+              if (!isFinite(this.boss.lastShot)) this.boss.lastShot = 0;
+              const canBossShoot =
+                typeof this.boss.lastShot === "number"
+                  ? nowt - this.boss.lastShot >
+                    (this.boss.bossType === "boss2" ? 600 : 900)
+                  : true;
+              if (canBossShoot) {
+                this.boss.lastShot = nowt;
+                try {
+                  this.bossShoot(this.boss);
+                } catch (e) {}
+              }
+            }
+          } catch (e) {}
 
           this.enemyBullets.children.iterate((b) => {
             if (!b || !b.active) return;
             if (b.y > H + 40) b.disableBody(true, true);
+            // lifetime expiry
+            try {
+              if (
+                this.time &&
+                this.time.now &&
+                b._expireAt &&
+                this.time.now > b._expireAt
+              ) {
+                return b.disableBody(true, true);
+              }
+            } catch (e) {}
+            // reapply stored velocity if physics stopped updating velocities
+            try {
+              if (
+                b.body &&
+                b.body.velocity &&
+                Math.abs(b.body.velocity.x) < 0.0001 &&
+                Math.abs(b.body.velocity.y) < 0.0001
+              ) {
+                if (typeof b._vx === "number" && typeof b._vy === "number") {
+                  if (typeof b.body.setVelocity === "function") {
+                    b.body.setVelocity(b._vx, b._vy);
+                  } else {
+                    b.body.velocity.x = b._vx;
+                    b.body.velocity.y = b._vy;
+                  }
+                }
+              }
+            } catch (e) {}
           });
+          // powerups: ensure offscreen cleanup and reapply velocities if necessary
+          this.powerups.children.iterate((p) => {
+            if (!p || !p.active) return;
+            if (p.y > H + 80 || p.y < -80) return p.disableBody(true, true);
+            try {
+              if (
+                this.time &&
+                this.time.now &&
+                p._expireAt &&
+                this.time.now > p._expireAt
+              ) {
+                return p.disableBody(true, true);
+              }
+            } catch (e) {}
+            try {
+              if (
+                p.body &&
+                p.body.velocity &&
+                Math.abs(p.body.velocity.x) < 0.0001 &&
+                Math.abs(p.body.velocity.y) < 0.0001
+              ) {
+                if (typeof p._vx === "number" && typeof p._vy === "number") {
+                  if (typeof p.body.setVelocity === "function") {
+                    p.body.setVelocity(p._vx, p._vy);
+                  } else {
+                    p.body.velocity.x = p._vx;
+                    p.body.velocity.y = p._vy;
+                  }
+                }
+              }
+            } catch (e) {}
+          });
+
+          // Manual nudge fallback: if velocities are effectively zero but _vx/_vy exist,
+          // move the object a little each frame so collision system can re-evaluate.
+          const nudge = (obj) => {
+            try {
+              if (!obj || !obj.active) return;
+              const vx =
+                obj.body &&
+                obj.body.velocity &&
+                Math.abs(obj.body.velocity.x) < 0.0001
+                  ? 0
+                  : obj.body && obj.body.velocity
+                  ? obj.body.velocity.x
+                  : 0;
+              const vy =
+                obj.body &&
+                obj.body.velocity &&
+                Math.abs(obj.body.velocity.y) < 0.0001
+                  ? 0
+                  : obj.body && obj.body.velocity
+                  ? obj.body.velocity.y
+                  : 0;
+              if (
+                vx === 0 &&
+                vy === 0 &&
+                typeof obj._vx === "number" &&
+                typeof obj._vy === "number"
+              ) {
+                // advance by a small fraction of stored velocity to re-trigger physics checks
+                const dt = Math.min(1 / 30, (delta || 16) / 1000);
+                obj.x += obj._vx * dt * 0.6;
+                obj.y += obj._vy * dt * 0.6;
+                // if body exists, sync body position
+                if (obj.body && typeof obj.body.reset === "function") {
+                  try {
+                    obj.body.reset(obj.x, obj.y);
+                  } catch (er) {}
+                }
+              }
+            } catch (er) {}
+          };
+          try {
+            this.enemyBullets.children.iterate((b) => nudge(b));
+            this.bullets.children.iterate((b) => nudge(b));
+            this.powerups.children.iterate((p) => nudge(p));
+          } catch (er) {}
+
+          // Defensive recovery: if an object is visible but lacks a usable physics body,
+          // try to re-add/reset the body so it remains collidable.
+          const tryRecover = (obj, name) => {
+            if (!obj || !obj.active || !obj.visible) return false;
+            try {
+              if (!obj.body || (obj.body && obj.body.enable === false)) {
+                // attempt to add physics body if missing
+                try {
+                  if (!obj.body && this.physics && this.physics.add) {
+                    this.physics.add.existing(obj);
+                  }
+                } catch (er) {}
+                try {
+                  if (obj.body && typeof obj.body.reset === "function")
+                    obj.body.reset(obj.x, obj.y);
+                  if (obj.body) obj.body.enable = true;
+                } catch (er) {}
+                // reapply stored velocity if present
+                try {
+                  if (obj.body && obj._vx && obj._vy) {
+                    if (typeof obj.body.setVelocity === "function")
+                      obj.body.setVelocity(obj._vx, obj._vy);
+                    else {
+                      obj.body.velocity.x = obj._vx;
+                      obj.body.velocity.y = obj._vy;
+                    }
+                  }
+                } catch (er) {}
+                try {
+                  console.log(`recovered ${name}`, { x: obj.x, y: obj.y });
+                } catch (er) {}
+                return true;
+              }
+            } catch (er) {}
+            return false;
+          };
+
+          // scan key groups for stuck but visible objects
+          try {
+            this.enemyBullets.children.iterate((b) =>
+              tryRecover(b, "enemyBullet")
+            );
+            this.bullets.children.iterate((b) => tryRecover(b, "playerBullet"));
+            this.powerups.children.iterate((p) => tryRecover(p, "powerup"));
+            this.enemies.children.iterate((e) => tryRecover(e, "enemy"));
+          } catch (er) {}
           // bullets: expire by lifetime or when out of bounds
           this.bullets.children.iterate((b) => {
             if (!b || !b.active) return;
@@ -693,6 +1674,17 @@
         try {
           game.scale.resize(W, H);
         } catch (e) {}
+        try {
+          const s =
+            game && game.scene && game.scene.scenes && game.scene.scenes[0];
+          if (
+            s &&
+            s.flashRect &&
+            typeof s.flashRect.setDisplaySize === "function"
+          ) {
+            s.flashRect.setDisplaySize(W, H);
+          }
+        } catch (ee) {}
       });
     </script>
   </body>
