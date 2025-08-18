@@ -2,26 +2,7 @@
 <html lang="ja">
   <head>
     <meta charset="utf-8" />
-    <link
-      rel="shortcut icon"
-      type="image/x-icon"
-      href="tomatina-shooting/favicon.ico"
-    />
-
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="twitter:card" content="summary" />
-    <meta name="twitter:site" content="@faunsu19000" />
-    <meta name="twitter:creator" content="@faunsu19000" />
-    <meta
-      property="og:url"
-      content="https://ymuichiro.github.io/tomatina-shooting/"
-    />
-    <meta property="og:title" content="Tomatina Shooting" />
-    <meta
-      property="og:description"
-      content="A simple game where you control a tomato plane to shoot down enemies."
-    />
-    <meta property="og:image" content="tomatina-shooting/icon.png" />
     <title>Tomato Squadron</title>
     <style>
       html,
@@ -1402,7 +1383,7 @@
         }
 
         onPlayerHit(player, source) {
-          // debug: log what hit the player and when
+          // debug: log what hit the player and when, include body/bounds info
           try {
             const key =
               source && source.texture
@@ -1410,12 +1391,34 @@
                 : source && source.constructor
                 ? source.constructor.name
                 : String(source);
-            console.log("onPlayerHit", {
+            const srcInfo = {
               time: this.time ? this.time.now : Date.now(),
               sourceKey: key,
               sx: source && source.x,
               sy: source && source.y,
-            });
+            };
+            try {
+              if (source && source.body) {
+                srcInfo.body = {
+                  enabled: !!source.body.enable,
+                  x: source.body.x,
+                  y: source.body.y,
+                  width: source.body.width,
+                  height: source.body.height,
+                };
+              }
+            } catch (er) {}
+            try {
+              if (player && player.body) {
+                srcInfo.playerBody = {
+                  x: player.body.x,
+                  y: player.body.y,
+                  width: player.body.width,
+                  height: player.body.height,
+                };
+              }
+            } catch (er) {}
+            console.log("onPlayerHit", srcInfo);
           } catch (e) {
             console.log("onPlayerHit logging failed", e);
           }
@@ -1784,6 +1787,36 @@
           const tryRecover = (obj, name) => {
             if (!obj || !obj.active || !obj.visible) return false;
             try {
+              // avoid re-enabling objects that are right on top of the player
+              try {
+                if (
+                  this.player &&
+                  typeof this.player.x === "number" &&
+                  typeof this.player.y === "number" &&
+                  typeof obj.x === "number" &&
+                  typeof obj.y === "number"
+                ) {
+                  const dx = obj.x - this.player.x;
+                  const dy = obj.y - this.player.y;
+                  const dist = Math.sqrt(dx * dx + dy * dy);
+                  // threshold: roughly a player radius (conservative)
+                  if (dist < 40) {
+                    try {
+                      console.log(
+                        `tryRecover: skipped ${name} (too close to player)`,
+                        {
+                          name,
+                          dist,
+                          objX: obj.x,
+                          objY: obj.y,
+                        }
+                      );
+                    } catch (er) {}
+                    return false;
+                  }
+                }
+              } catch (er) {}
+
               if (!obj.body || (obj.body && obj.body.enable === false)) {
                 // attempt to add physics body if missing
                 try {
