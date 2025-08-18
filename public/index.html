@@ -136,15 +136,63 @@
       }
       function makeBackground(scene) {
         const g = scene.make.graphics({ x: 0, y: 0, add: false });
-        g.fillStyle(0x0b0f1a, 1);
-        g.fillRect(0, 0, W, H);
-        g.fillStyle(0x11203a, 1);
-        for (let i = 0; i < 40; i++) {
-          const x = Math.random() * W,
-            y = Math.random() * H,
-            r = 4 + Math.random() * 14;
-          g.fillCircle(x, y, r);
+
+        // 宇宙のような深いグラデーション背景（複数色で段階的に描画）
+        const colors = [
+          { color: 0x0b0f2a, y: 0, height: H * 0.3 },
+          { color: 0x1a0b2e, y: H * 0.2, height: H * 0.3 },
+          { color: 0x16213e, y: H * 0.4, height: H * 0.4 },
+          { color: 0x0f1419, y: H * 0.7, height: H * 0.3 },
+        ];
+
+        // 段階的グラデーション効果
+        for (let layer of colors) {
+          g.fillStyle(layer.color, 0.8);
+          g.fillRect(0, layer.y, W, layer.height);
         }
+
+        // 遠くの星々（小さな点）
+        g.fillStyle(0xffffff, 0.8);
+        for (let i = 0; i < 150; i++) {
+          const x = Math.random() * W;
+          const y = Math.random() * H;
+          const size = 0.5 + Math.random() * 1.5;
+          g.fillCircle(x, y, size);
+        }
+
+        // 明るい星（きらめき効果）
+        g.fillStyle(0xaaccff, 0.9);
+        for (let i = 0; i < 25; i++) {
+          const x = Math.random() * W;
+          const y = Math.random() * H;
+          const size = 1 + Math.random() * 2;
+          g.fillCircle(x, y, size);
+        }
+
+        // スピード線（縦の流線）
+        g.lineStyle(1, 0x4466aa, 0.3);
+        for (let i = 0; i < 30; i++) {
+          const x = Math.random() * W;
+          const startY = Math.random() * H * 0.3;
+          const length = 40 + Math.random() * 120;
+          g.beginPath();
+          g.moveTo(x, startY);
+          g.lineTo(x, startY + length);
+          g.strokePath();
+        }
+
+        // より明るいスピード線
+        g.lineStyle(2, 0x66aaff, 0.2);
+        for (let i = 0; i < 12; i++) {
+          const x = Math.random() * W;
+          const startY = Math.random() * H * 0.4;
+          const length = 80 + Math.random() * 200;
+          g.beginPath();
+          g.moveTo(x, startY);
+          g.lineTo(x, startY + length);
+          g.strokePath();
+        }
+
         g.generateTexture("bg", W, H);
         g.destroy();
       }
@@ -216,11 +264,41 @@
           makeSeedParticle(this);
           makeJuiceParticle(this);
           makeSuperItemTexture(this);
+
+          // 多層背景でスピード感演出
           this.add.image(W / 2, H / 2, "bg").setDepth(-10);
+
+          // メインスクロール背景
           this.bgScroll = this.add
             .tileSprite(W / 2, H / 2, W, H, "bg")
-            .setAlpha(0.25)
+            .setAlpha(0.3)
             .setDepth(-9);
+
+          // 高速スクロール星フィールド層
+          this.starField = this.add.graphics().setDepth(-8);
+          this.starField.fillStyle(0xffffff, 0.6);
+          this.stars = [];
+          for (let i = 0; i < 100; i++) {
+            this.stars.push({
+              x: Math.random() * W,
+              y: Math.random() * H,
+              speed: 2 + Math.random() * 8,
+              size: 0.5 + Math.random() * 1.5,
+            });
+          }
+
+          // スピード線層
+          this.speedLines = this.add.graphics().setDepth(-7);
+          this.lines = [];
+          for (let i = 0; i < 20; i++) {
+            this.lines.push({
+              x: Math.random() * W,
+              y: Math.random() * H,
+              length: 50 + Math.random() * 150,
+              speed: 8 + Math.random() * 12,
+              alpha: 0.2 + Math.random() * 0.3,
+            });
+          }
 
           this.player = this.physics.add.image(W / 2, H - 80, "player");
           // pools: player bullets, enemies, enemy bullets, powerups
@@ -451,7 +529,7 @@
                 );
               } catch (e) {}
             }
-            b.hp = 20; // Boss1 has more HP
+            b.hp = 500; // Boss1 has more HP
             b.maxHp = 500;
             b.lastShot = 0;
             b.bossType = "boss1";
@@ -509,8 +587,8 @@
                 );
               } catch (e) {}
             }
-            b.hp = 50; // Boss2 has much more HP
-            b.maxHp = 1000;
+            b.hp = 2000; // Boss2 has much more HP
+            b.maxHp = 2000;
             b.lastShot = 0;
             b.bossType = "boss2";
             // prevent multiple simultaneous hits from counting as separate damage
@@ -1217,6 +1295,31 @@
               this.inFever = true;
               this.feverUntil = this.time.now + FEVER_DURATION;
               this.cameras.main.shake(200, 0.006);
+
+              // フィーバー時の背景エフェクト強化
+              if (this.stars) {
+                // 星の数を一時的に増やす
+                for (let i = 0; i < 50; i++) {
+                  this.stars.push({
+                    x: Math.random() * W,
+                    y: Math.random() * H,
+                    speed: 5 + Math.random() * 15,
+                    size: 1 + Math.random() * 2,
+                  });
+                }
+              }
+              if (this.lines) {
+                // スピード線を一時的に増やす
+                for (let i = 0; i < 15; i++) {
+                  this.lines.push({
+                    x: Math.random() * W,
+                    y: Math.random() * H,
+                    length: 80 + Math.random() * 200,
+                    speed: 12 + Math.random() * 18,
+                    alpha: 0.3 + Math.random() * 0.4,
+                  });
+                }
+              }
             }
           }
         }
@@ -1381,8 +1484,54 @@
         }
 
         update(time, delta) {
-          // faster background scroll for speed feeling
-          this.bgScroll.tilePositionY -= 1.2 + (this.difficulty - 1) * 0.4;
+          // 多層背景アニメーション - スピード感演出
+          const speedMultiplier = 1 + (this.difficulty - 1) * 0.5;
+          const feverBoost = this.inFever ? 1.3 : 1;
+          const baseSpeed = speedMultiplier * feverBoost;
+
+          // メイン背景スクロール
+          this.bgScroll.tilePositionY -=
+            (1.8 + (this.difficulty - 1) * 0.6) * feverBoost;
+
+          // 動的星フィールド更新
+          if (this.starField && this.stars) {
+            this.starField.clear();
+            this.starField.fillStyle(0xffffff, 0.6);
+
+            for (let star of this.stars) {
+              star.y += star.speed * baseSpeed;
+              if (star.y > H + 10) {
+                star.y = -10;
+                star.x = Math.random() * W;
+              }
+              this.starField.fillCircle(star.x, star.y, star.size);
+            }
+          }
+
+          // 動的スピード線更新
+          if (this.speedLines && this.lines) {
+            this.speedLines.clear();
+
+            for (let line of this.lines) {
+              line.y += line.speed * baseSpeed;
+              if (line.y > H + line.length) {
+                line.y = -line.length;
+                line.x = Math.random() * W;
+                line.alpha = 0.1 + Math.random() * 0.4;
+              }
+
+              this.speedLines.lineStyle(
+                1 + Math.random(),
+                0x4488ff,
+                line.alpha
+              );
+              this.speedLines.beginPath();
+              this.speedLines.moveTo(line.x, line.y);
+              this.speedLines.lineTo(line.x, line.y + line.length);
+              this.speedLines.strokePath();
+            }
+          }
+
           if (this.gameOver) return;
 
           if (time - this.lastDiffStep > DIFFICULTY_STEP_MS) {
@@ -1412,6 +1561,14 @@
           if (this.inFever && time > this.feverUntil) {
             this.inFever = false;
             this.consecHits = 0;
+
+            // フィーバー終了時に追加エフェクトをリセット
+            if (this.stars && this.stars.length > 100) {
+              this.stars.length = 100; // 元の数に戻す
+            }
+            if (this.lines && this.lines.length > 20) {
+              this.lines.length = 20; // 元の数に戻す
+            }
           }
           // clear super state when expired
           if (this.isSuper && time > (this.superUntil || 0)) {
