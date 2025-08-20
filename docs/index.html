@@ -52,10 +52,12 @@
       const ENEMY_BASE_SPEED = 120;
       const ENEMY_HP_BASE = 1;
       const SPAWN_INTERVAL = 550;
-      const DIFFICULTY_STEP_MS = 8000;
-      const DIFFICULTY_GROWTH = 1.12;
+      // 難易度上昇間隔/増加率を緩やかに (仕様変更要望)
+      const DIFFICULTY_STEP_MS = 12000; // 旧:8000 -> 上昇タイミングを遅く
+      const DIFFICULTY_GROWTH = 1.08; // 旧:1.12 -> 伸び率を緩和
       const FEVER_THRESHOLD = 8;
       const FEVER_DURATION = 3000;
+      const BASE_SCORE = 10; // 1体あたりの基本得点。difficulty によって倍率がかかる
       const HYPER_RATE = 40;
       const HYPER_COOLDOWN = 4500;
       const SUPER_DURATION = 4200;
@@ -97,6 +99,25 @@
         g.fillStyle(0x1ecbe1, 0.9); // cockpit
         g.fillEllipse(18, 6, 6, 6);
         g.generateTexture("player", 36, 28);
+        g.destroy();
+      }
+      // パワーアップ中表示 (翼を開いた大型シルエット)
+      function makePlayerOpenTexture(scene) {
+        const g = scene.make.graphics({ x: 0, y: 0, add: false });
+        g.fillStyle(0xd7263d, 1);
+        g.beginPath();
+        g.moveTo(24, 0); // nose (少し前方)
+        g.lineTo(44, 14); // right extended wing tip
+        g.lineTo(30, 14);
+        g.lineTo(30, 30); // tail right
+        g.lineTo(18, 30); // tail left
+        g.lineTo(18, 14);
+        g.lineTo(4, 14); // left extended wing tip
+        g.closePath();
+        g.fillPath();
+        g.fillStyle(0x50e8ff, 0.95); // cockpit (色も少し変化)
+        g.fillEllipse(24, 8, 8, 8);
+        g.generateTexture("playerOpen", 48, 34);
         g.destroy();
       }
       function makeEnemyTexture(scene) {
@@ -224,6 +245,7 @@
         }
         init() {
           this.kills = 0;
+          this.score = 0;
           this.consecHits = 0;
           this.inFever = false;
           this.feverUntil = 0;
@@ -283,6 +305,7 @@
           makeTomatoTexture(this);
           makeEnemyTexture(this);
           makePlayerTexture(this);
+          makePlayerOpenTexture(this);
           makeSeedParticle(this);
           makeJuiceParticle(this);
           makeSuperItemTexture(this);
@@ -323,6 +346,23 @@
           }
 
           this.player = this.physics.add.image(W / 2, H - 80, "player");
+          // 現行パワーモード: normal / fever / super (重複時は常に新しい方で上書き)
+          this.powerMode = "normal";
+          this.updatePlayerAppearance = () => {
+            try {
+              const mode = this.powerMode;
+              const needOpen = mode === "fever" || mode === "super";
+              const tex = needOpen ? "playerOpen" : "player";
+              if (this.player.texture.key !== tex) this.player.setTexture(tex);
+              // 無敵中は点滅(アルファ)演出
+              if (needOpen) {
+                const t = (this.time ? this.time.now : Date.now()) * 0.01;
+                this.player.setAlpha(0.75 + 0.25 * Math.sin(t));
+              } else {
+                this.player.setAlpha(1);
+              }
+            } catch (e) {}
+          };
           // pools: player bullets, enemies, enemy bullets, powerups
           this.bullets = this.physics.add.group({
             classType: Phaser.Physics.Arcade.Image,
@@ -425,6 +465,11 @@
             fontFamily: "monospace",
             fontSize: "20px",
             color: "#fff",
+          });
+          this.scoreHud = this.add.text(12, 78, "SCORE: 0", {
+            fontFamily: "monospace",
+            fontSize: "16px",
+            color: "#ffdcbc",
           });
           this.hud2 = this.add.text(12, 34, "FEVER: 0", {
             fontFamily: "monospace",
@@ -928,6 +973,19 @@
                 console.log("Boss defeated:", canonical.bossType);
               } catch (e) {}
 
+              // ボス撃破ボーナス得点
+              try {
+                const bonus = canonical.bossType === "boss2" ? 300 : 100;
+                if (typeof this.score === "number") {
+                  this.score += bonus;
+                  if (
+                    this.scoreHud &&
+                    typeof this.scoreHud.setText === "function"
+                  )
+                    this.scoreHud.setText(`SCORE: ${this.score}`);
+                }
+              } catch (e) {}
+
               // drop more powerups based on boss type
               const powerupCount = canonical.bossType === "boss2" ? 8 : 5;
               for (let i = 0; i < powerupCount; i++) {
@@ -1229,6 +1287,15 @@
           if (enemy.hp <= 0) {
             enemy.disableBody(true, true);
             this.kills++;
+            // スコアは difficulty に応じて倍率をかける
+            try {
+              const gain = Math.max(
+                1,
+                Math.round(BASE_SCORE * this.difficulty)
+              );
+              this.score += gain;
+              this.scoreHud.setText(`SCORE: ${this.score}`);
+            } catch (e) {}
 
             // spawn bosses based on score thresholds
             try {
@@ -1349,18 +1416,44 @@
         onPickup(player, p) {
           // consume pickup
           p.disableBody(true, true);
+          // 先に既存状態を上書き (重複可 & 新しい方を優先)
           if (p.isSuper) {
-            // immediate spectacular burst
+            this.inFever = false; // フィーバー解除
+            this.isSuper = true;
+            this.superUntil = this.time.now + SUPER_DURATION; // 常に上書き
+            this.powerMode = "super";
+            // immediate spectacular burst (演出は従来通り)
             for (let i = 0; i < SUPER_BURST_COUNT; i++) {
               const a =
                 (Math.PI * 2 * i) / SUPER_BURST_COUNT +
                 (Math.random() - 0.5) * 0.06;
-              // create tomato bullets in a big circle around player
-              const b = this.bullets.get(
+              // try pool first
+              let b = this.bullets.get(
                 this.player.x,
                 this.player.y - 12,
                 "tomatoBullet"
               );
+              // fallback: create a dedicated physics image so burst always appears
+              if (!b) {
+                try {
+                  b = this.physics.add.image(
+                    this.player.x,
+                    this.player.y - 12,
+                    "tomatoBullet"
+                  );
+                } catch (err) {
+                  continue;
+                }
+                // ensure it doesn't linger: schedule cleanup
+                try {
+                  this.time.delayedCall(BULLET_LIFETIME, () => {
+                    try {
+                      if (b && b.disableBody) b.disableBody(true, true);
+                      else if (b && b.destroy) b.destroy();
+                    } catch (e) {}
+                  });
+                } catch (e) {}
+              }
               if (!b) continue;
               b.setActive(true).setVisible(true);
               if (b.body) {
@@ -1371,13 +1464,21 @@
                   if (typeof b.body.setCircle === "function")
                     b.body.setCircle(8, 8, 8);
                 } catch (e) {}
+              } else {
+                // if no physics body, try to add one
+                try {
+                  if (this.physics && this.physics.add)
+                    this.physics.add.existing(b);
+                } catch (e) {}
               }
               b.setPosition(this.player.x, this.player.y - 12);
               b.setAngle(Phaser.Math.RadToDeg(a));
               const speed = SUPER_BULLET_SPEED;
               if (b.body) {
-                b.body.velocity.x = Math.sin(a) * speed;
-                b.body.velocity.y = -Math.cos(a) * speed;
+                try {
+                  b.body.velocity.x = Math.sin(a) * speed;
+                  b.body.velocity.y = -Math.cos(a) * speed;
+                } catch (e) {}
                 try {
                   b._vx = b.body.velocity.x;
                   b._vy = b.body.velocity.y;
@@ -1392,19 +1493,21 @@
               }
               b._expireAt = this.time.now + BULLET_LIFETIME;
             }
-            // set temporary super state
-            this.isSuper = true;
-            this.superUntil = this.time.now + SUPER_DURATION;
             this.cameras.main.shake(260, 0.006);
           } else {
-            // default tomato pickup: fever boost
+            // FEVER は常に新しい残時間で上書き
+            this.isSuper = false; // SUPER解除
             this.inFever = true;
-            this.feverUntil = Math.max(this.feverUntil, this.time.now + 2000);
+            this.feverUntil = this.time.now + FEVER_DURATION;
+            this.powerMode = "fever";
             this.cameras.main.shake(150, 0.004);
           }
+          this.updatePlayerAppearance();
         }
 
         onPlayerHit(player, source) {
+          // 無敵 (パワーアップ中) は被弾無効
+          if (this.isSuper || this.inFever) return;
           // debug: log what hit the player and when
           try {
             const key =
@@ -1583,6 +1686,7 @@
           if (this.inFever && time > this.feverUntil) {
             this.inFever = false;
             this.consecHits = 0;
+            if (this.powerMode === "fever") this.powerMode = "normal";
 
             // フィーバー終了時に追加エフェクトをリセット
             if (this.stars && this.stars.length > 100) {
@@ -1595,7 +1699,10 @@
           // clear super state when expired
           if (this.isSuper && time > (this.superUntil || 0)) {
             this.isSuper = false;
+            if (this.powerMode === "super") this.powerMode = "normal";
           }
+          // 外観更新 (パワーアップ終了/継続)
+          this.updatePlayerAppearance();
           this.hud3.setText(`SUPER: ${this.isSuper ? "ON" : "OFF"}`);
           this.hud2.setText(
             `FEVER: ${
